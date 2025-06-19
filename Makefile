@@ -1,7 +1,8 @@
 
-CXXFLAGS = -Wall -Wextra -Os -std=c++20 -ggdb3
-CFLAGS = -Wall -Wextra -Os -ggdb3
-LDFLAGS = -Os -ggdb3
+COMMON_FLAGS = -Wall -Wextra -Wno-gnu -Os -ggdb3 -ffunction-sections -fdata-sections -flto -Wno-unused-function -Wno-unused-parameter
+CXXFLAGS = -std=gnu++20 $(COMMON_FLAGS)
+CFLAGS = -std=gnu11 $(COMMON_FLAGS)
+LDFLAGS = -Os -ggdb3 -flto
 LIBS = -lpthread
 
 all: gwchat
