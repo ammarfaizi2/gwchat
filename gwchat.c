@@ -164,8 +164,16 @@ struct gwc_message {
 struct gwc_srv_cli {
 	int			fd;
 	struct gwc_user		*user;
-	struct gwc_pkt		pkt;
 	size_t			pkt_len;
+	size_t			pkt_sn_len;
+	union {
+		struct gwc_pkt		pkt;
+		char			__pkt_raw[sizeof(struct gwc_pkt)];
+	};
+	union {
+		struct gwc_pkt		pkt_sn;
+		char			__pkt_sn_raw[sizeof(struct gwc_pkt)];
+	};
 };
 
 struct gwc_srv_ctx;
@@ -240,17 +248,7 @@ static inline size_t pkt_hdr_prep(struct gwc_pkt *p, uint8_t type, size_t len)
 
 static inline size_t pkt_prep_conn_hs(struct gwc_pkt *p)
 {
-	uint8_t *x;
-
-	x = (uint8_t *)&p->conn.hs.magic;
-	x[0] = 'g';
-	x[1] = 'w';
-	x[2] = 'c';
-	x[3] = 'h';
-	x[4] = 'a';
-	x[5] = 't';
-	x[6] = '0';
-	x[7] = '1';
+	memcpy(&p->conn.hs.magic, "gwchat01", 8);
 	return pkt_hdr_prep(p, GWC_PKT_CONN_HANDSHAKE, sizeof(p->conn.hs));
 }
 
@@ -533,6 +531,15 @@ static int gwc_srv_handle_event_accept(struct gwc_srv_wrk *w)
 	return 0;
 }
 
+static int gwc_srv_register_user(struct gwc_srv_wrk *w, struct gwc_srv_cli *c,
+				 const char *uname, const char *pwd)
+{
+	return 0;
+}
+
+static int gwc_srv_handle_event_send(struct gwc_srv_wrk *w,
+				     struct gwc_srv_cli *c);
+
 static int gwc_srv_handle_pkt_conn_hs(struct gwc_srv_wrk *w,
 				      struct gwc_srv_cli *c)
 {
@@ -544,7 +551,33 @@ static int gwc_srv_handle_pkt_conn_hs(struct gwc_srv_wrk *w,
 	if (memcmp(p->conn.hs.magic, "gwchat01", 8))
 		return -EINVAL;
 
-	return 0;
+	if (!c->pkt_sn_len)
+		c->pkt_sn_len = pkt_prep_conn_hs_ack(&c->pkt_sn);
+
+	return gwc_srv_handle_event_send(w, c);
+}
+
+static int gwc_srv_handle_pkt_acc_reg(struct gwc_srv_wrk *w,
+				      struct gwc_srv_cli *c)
+{
+	struct gwc_pkt_acc_udata *reg = &c->pkt.acc.reg;
+	struct gwc_pkt *p = &c->pkt;
+	char uname[128], pwd[128];
+	size_t tot_len;
+
+	if (p->hdr.len < sizeof(p->acc.reg))
+		return -EINVAL;
+	if (reg->ulen > 127 || reg->plen > 127)
+		return -EINVAL;
+	tot_len = sizeof(*reg) + reg->ulen + reg->plen + 2;
+	if (p->hdr.len != tot_len)
+		return -EINVAL;
+
+	strncpy(uname, reg->data, sizeof(uname) - 1);
+	uname[sizeof(uname) - 1] = '\0';
+	strncpy(pwd, &reg->data[reg->ulen + 1], sizeof(pwd) - 1);
+	pwd[sizeof(pwd) - 1] = '\0';
+	return gwc_srv_register_user(w, c, uname, pwd);
 }
 
 static int gwc_srv_handle_cli_pkt(struct gwc_srv_wrk *w, struct gwc_srv_cli *c)
@@ -554,10 +587,10 @@ static int gwc_srv_handle_cli_pkt(struct gwc_srv_wrk *w, struct gwc_srv_cli *c)
 		return gwc_srv_handle_pkt_conn_hs(w, c);
 	case GWC_PKT_CONN_HANDSHAKE_ACK:
 		return -EINVAL;
-	// case GWC_PKT_CONN_CLOSE:
-	// 	return gwc_srv_handle_pkt_conn_close(w, c);
-	// case GWC_PKT_ACC_REGISTER:
-	// 	return gwc_srv_handle_pkt_acc_reg(w, c);
+	case GWC_PKT_CONN_CLOSE:
+		return -ECONNRESET;
+	case GWC_PKT_ACC_REGISTER:
+		return gwc_srv_handle_pkt_acc_reg(w, c);
 	// case GWC_PKT_ACC_LOGIN:
 	// 	return gwc_srv_handle_pkt_acc_login(w, c);
 	// case GWC_PKT_ACC_CHANGE_PWD:
@@ -638,6 +671,35 @@ static int gwc_srv_handle_event_recv(struct gwc_srv_wrk *w,
 static int gwc_srv_handle_event_send(struct gwc_srv_wrk *w,
 				     struct gwc_srv_cli *c)
 {
+	ssize_t ret;
+	size_t len;
+	char *buf;
+
+	len = c->pkt_sn_len;
+	if (!len)
+		return 0;
+
+	buf = (char *)&c->pkt_sn;
+	ret = send(c->fd, buf, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN || ret == -EINTR)
+			return 0;
+
+		return ret;
+	} else if (!ret) {
+		return -ECONNRESET;
+	}
+
+	assert(ret <= (ssize_t)len);
+	c->pkt_sn_len -= (size_t)ret;
+	if (c->pkt_sn_len) {
+		memmove(&c->pkt_sn, (char *)&c->pkt_sn + ret, c->pkt_sn_len);
+	} else {
+		if (c->pkt_len)
+			return gwc_srv_handle_cli_pkt(w, c);
+	}
+
 	return 0;
 }
 
@@ -650,6 +712,11 @@ static int gwc_srv_handle_event_close(struct gwc_srv_wrk *w, int i)
 	close(arr->clients[i].fd);
 	arr->pfd[idx] = arr->pfd[last];
 	arr->clients[i] = arr->clients[last - 1];
+
+	if (w->accept_stopped) {
+		arr->pfd[0].fd = w->tcp_fd;
+		w->accept_stopped = false;
+	}
 
 	return gwc_srv_shrink_arr_if_reasonable(arr);
 }
@@ -955,13 +1022,15 @@ static int gwc_srv_init_worker(struct gwc_srv_wrk *w)
 
 	r = gwc_srv_init_worker_sock(w);
 	if (r < 0) {
-		fprintf(stderr, "Failed to initialize worker socket: %s\n", strerror(-r));
+		fprintf(stderr, "Failed to initialize worker socket: %s\n",
+			strerror(-r));
 		return r;
 	}
 
 	r = gwc_srv_init_worker_cli_arr(w);
 	if (r < 0) {
-		fprintf(stderr, "Failed to initialize worker client array: %s\n", strerror(-r));
+		fprintf(stderr, "Failed to initialize worker client array: %s\n",
+			strerror(-r));
 		goto oe_sock;
 	}
 
@@ -971,7 +1040,8 @@ static int gwc_srv_init_worker(struct gwc_srv_wrk *w)
 	r = pthread_create(&w->thread, NULL, &gwc_srv_worker_func, w);
 	if (r < 0) {
 		r = -r;
-		fprintf(stderr, "Failed to create worker thread: %s\n", strerror(-r));
+		fprintf(stderr, "Failed to create worker thread: %s\n",
+			strerror(-r));
 		goto oe_cli_arr;
 	}
 

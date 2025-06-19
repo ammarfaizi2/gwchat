@@ -1,5 +1,7 @@
 
-COMMON_FLAGS = -Wall -Wextra -Wno-gnu -Os -ggdb3 -ffunction-sections -fdata-sections -flto -Wno-unused-function -Wno-unused-parameter
+COMMON_FLAGS = -Wall -Wextra -Wno-gnu -Os -ggdb3 -ffunction-sections \
+	-fdata-sections -flto -Wno-unused-function -Wno-unused-parameter \
+	-fno-strict-aliasing
 CXXFLAGS = -std=gnu++20 $(COMMON_FLAGS)
 CFLAGS = -std=gnu11 $(COMMON_FLAGS)
 LDFLAGS = -Os -ggdb3 -flto
