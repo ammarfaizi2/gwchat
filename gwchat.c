@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <ctype.h>
 
 #include <pthread.h>
 #include <getopt.h>
@@ -82,6 +83,7 @@ enum {
 	GWC_PKT_CHAN_LIST		= 0x22,
 	GWC_PKT_CHAN_LIST_MSG		= 0x23,
 	GWC_PKT_CHAN_SEND_MSG		= 0x24,
+	GWC_PKT_CHAN_CREATE		= 0x25,
 
 	GWC_PKT_RESERVED		= 0xff,
 };
@@ -165,10 +167,10 @@ struct gwc_pkt {
 			struct gwc_pkt_chan_list	chan_list;
 		} chan __packed;
 
-		char	__raw[4096 - sizeof(struct gwc_hdr_pkt)];
+		char	__raw[2048 - sizeof(struct gwc_hdr_pkt)];
 	} __packed;
 } __packed;
-ST_ASSERT(sizeof(struct gwc_pkt) == 4096);
+ST_ASSERT(sizeof(struct gwc_pkt) == 2048);
 ST_ASSERT(offsetof(struct gwc_pkt, hdr) == 0);
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, conn));
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, conn.hs));
@@ -219,6 +221,11 @@ struct gwc_buf {
 	uint32_t	len;
 	uint32_t	cap;
 	char		*orig;
+};
+
+struct gwc_bufl {
+	struct gwc_buf	b;
+	pthread_mutex_t	lock;
 };
 
 static int gwc_buf_init(struct gwc_buf *b, uint32_t cap)
@@ -287,6 +294,55 @@ static int gwc_buf_append(struct gwc_buf *b, const void *data, uint32_t len)
 	b->len += len;
 	b->buf[b->len] = '\0';
 	return 0;
+}
+
+static int gwc_bufl_init(struct gwc_bufl *bl, uint32_t cap)
+{
+	int ret;
+
+	ret = gwc_buf_init(&bl->b, cap);
+	if (ret)
+		return ret;
+
+	ret = pthread_mutex_init(&bl->lock, NULL);
+	if (ret) {
+		gwc_buf_free(&bl->b);
+		return -ret;
+	}
+	return 0;
+}
+
+static void gwc_bufl_free(struct gwc_bufl *bl)
+{
+	if (!bl)
+		return;
+
+	pthread_mutex_destroy(&bl->lock);
+	gwc_buf_free(&bl->b);
+}
+
+static void gwc_bufl_sync(struct gwc_bufl *bl)
+{
+	pthread_mutex_lock(&bl->lock);
+	gwc_buf_sync(&bl->b);
+	pthread_mutex_unlock(&bl->lock);
+}
+
+static int gwc_bufl_append(struct gwc_bufl *bl, const void *data, uint32_t len)
+{
+	int ret;
+
+	pthread_mutex_lock(&bl->lock);
+	ret = gwc_buf_append(&bl->b, data, len);
+	pthread_mutex_unlock(&bl->lock);
+	return ret;
+}
+
+static void gwc_bufl_soft_advance(struct gwc_bufl *bl, uint32_t len)
+{
+	pthread_mutex_lock(&bl->lock);
+	gwc_buf_soft_advance(&bl->b, len);
+	pthread_mutex_unlock(&bl->lock);
 }
 
 struct gwc_srv_cli {
@@ -370,13 +426,13 @@ struct gwc_cli_cfg {
 struct gwc_cli_ctx {
 	volatile bool		stop;
 	int			tcp_fd;
-	struct pollfd		pfd[2];
 	size_t			rc_len;
 	struct gwc_pkt		rc_buf;
 	struct gwc_buf		sn_buf;
 	struct gwc_cli_cfg	cfg;
 	struct sockaddr_storage	server_addr;
 	socklen_t		server_addr_len;
+	char			cmd_buf[4096];
 };
 
 static inline const char *gwc_user_uname(struct gwc_user *u)
@@ -2017,6 +2073,33 @@ static int gwc_cli_do_handshake(struct gwc_cli_ctx *ctx)
 	return 0;
 }
 
+/*
+ * Trim the leading and trailing whitespace from the string
+ * and move the trimmed string to the beginning of the buffer.
+ */ 
+static char *trim_move(char *orig)
+{
+	char *start = orig;
+	char *end = orig + strlen(orig) - 1;
+
+	// Trim leading whitespace
+	while (*start && isspace((unsigned char)*start))
+		start++;
+
+	// Trim trailing whitespace
+	while (end > start && isspace((unsigned char)*end))
+		end--;
+
+	// Null-terminate the trimmed string
+	end[1] = '\0';
+
+	// Move the trimmed string to the beginning of the buffer
+	if (start != orig)
+		memmove(orig, start, end - start + 2);
+
+	return orig;
+}
+
 static char *fgets_stdin_and_trim(char *buf, size_t size)
 {
 	size_t len;
@@ -2025,10 +2108,13 @@ static char *fgets_stdin_and_trim(char *buf, size_t size)
 		return NULL;
 
 	len = strlen(buf);
-	if (len > 0 && buf[len - 1] == '\n')
+	if (!len)
+		return NULL;
+
+	if (buf[len - 1] == '\n')
 		buf[len - 1] = '\0';
 
-	return buf;
+	return trim_move(buf);
 }
 
 static void gwc_cli_print_rl_error(uint8_t resp)
@@ -2104,6 +2190,97 @@ static int gwc_cli_do_register_or_login(struct gwc_cli_ctx *ctx)
 	return -EBADMSG;
 }
 
+static int gwc_cli_handle_event_recv(struct gwc_cli_ctx *ctx)
+{
+	return 0;
+}
+
+static void gwc_cli_show_help(void)
+{
+	printf("Available commands:\n");
+	printf("  help, ?                    - show this help message\n");
+	printf("  exit, quit, q              - exit the client\n");
+	printf("Channel commands:\n");
+	printf("  chan_sub <channel_id>      - subscribe to a channel\n");
+	printf("  chan_unsub <channel_id>    - unsubscribe from a channel\n");
+	printf("  chan_list                  - list all channels\n");
+	printf("  chan_list_msg <channel_id> - list messages in a channel\n");
+	printf("  chan_open <channel_id>     - open a channel\n");
+	printf("  chan_create <channel_name> - create a new channel\n");
+}
+
+static int gwc_cli_handle_event_stdin(struct gwc_cli_ctx *ctx)
+{
+	size_t l = sizeof(ctx->cmd_buf);
+	char *b = ctx->cmd_buf;
+
+	if (!fgets_stdin_and_trim(b, l)) {
+		fprintf(stderr, "Failed to read from stdin: %s\n", strerror(errno));
+		return -EIO;
+	}
+
+	if (!strcmp(b, "exit") || !strcmp(b, "quit") || !strcmp(b, "q")) {
+		printf("Exiting...\n");
+		ctx->stop = true;
+		return 0;
+	}
+
+	if (!strcmp(b, "help") || !strcmp(b, "?")) {
+		gwc_cli_show_help();
+		return 0;
+	}
+
+	if (!*b)
+		return 0;
+
+	printf("Invalid command: '%s'. Type 'help' for available commands.\n", b);
+	return 0;
+}
+
+static int gwc_cli_run_loop(struct gwc_cli_ctx *ctx)
+{
+	struct pollfd pfd[2];
+	int r;
+
+	pfd[0].fd = ctx->tcp_fd;
+	pfd[0].events = POLLIN | POLLRDHUP;
+	pfd[0].revents = 0;
+	pfd[1].fd = STDIN_FILENO;
+	pfd[1].events = POLLIN | POLLRDHUP;
+	pfd[1].revents = 0;
+
+	printf("\n");
+	printf("Welcome to gwchat client!\n");
+	printf("Type 'help' to see available commands.\n");
+
+	while (!ctx->stop) {
+		printf("gwchat > ");
+		fflush(stdout);
+		r = poll(pfd, 2, -1);
+		if (r < 0) {
+			r = -errno;
+			if (r == -EINTR)
+				continue;
+			fprintf(stderr, "Poll error: %s\n", strerror(-r));
+			return r;
+		}
+
+		if (pfd[0].revents & POLLIN) {
+			r = gwc_cli_handle_event_recv(ctx);
+			if (r)
+				break;
+		}
+
+		if (pfd[1].revents & POLLIN) {
+			r = gwc_cli_handle_event_stdin(ctx);
+			if (r)
+				break;
+		}
+	}
+
+	return 0;
+}
+
 static int gwc_cli_run(struct gwc_cli_ctx *ctx)
 {
 	int r;
@@ -2120,8 +2297,11 @@ static int gwc_cli_run(struct gwc_cli_ctx *ctx)
 	r = gwc_cli_do_register_or_login(ctx);
 	if (r)
 		return r;
+	r = sock_set_nonblock(ctx->tcp_fd, true);
+	if (r)
+		return r;
 
-	return 0;
+	return gwc_cli_run_loop(ctx);
 }
 
 noinline static int server_run(int argc, char *argv[])
