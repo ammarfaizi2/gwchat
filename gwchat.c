@@ -75,10 +75,7 @@ enum {
 	GWC_PKT_ACC_REGISTER		= 0x12,
 	GWC_PKT_ACC_LOGIN		= 0x13,
 	GWC_PKT_ACC_CHANGE_PWD		= 0x14,
-	/* Response to register/login success. */
-	GWC_PKT_ACC_RL_OK		= 0x15,
-	/* Response to register/login error.   */
-	GWC_PKT_ACC_RL_ERR		= 0x16, 
+	GWC_PKT_ACC_RESP_RL		= 0x15,
 
 	GWC_PKT_CHAN_SUBSCRIBE		= 0x20,
 	GWC_PKT_CHAN_UNSUBSCRIBE	= 0x21,
@@ -180,6 +177,7 @@ ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, acc));
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, acc.reg));
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, acc.login));
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, acc.change_pwd));
+ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, acc.rl_resp));
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, chan));
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, chan.subscribe));
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, chan.unsubscribe));
@@ -190,8 +188,8 @@ ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, chan.chan_list)
 
 struct gwc_user {
 	uint64_t	id;
-	char		uname[128];
-	char		pwd[128];
+	char		uname[255];
+	char		pwd[255];
 } __packed;
 
 struct gwc_channel {
@@ -209,6 +207,11 @@ struct gwc_message {
 	uint64_t	user_id;
 	uint64_t	timestamp;
 	char		data[512];
+} __packed;
+
+struct gwc_chan_sub {
+	uint64_t	chan_id;
+	uint64_t	user_id;
 } __packed;
 
 struct gwc_buf {
@@ -233,7 +236,7 @@ static int gwc_buf_init(struct gwc_buf *b, uint32_t cap)
 
 static void gwc_buf_free(struct gwc_buf *b)
 {
-	if (b->buf) {
+	if (b->orig) {
 		free(b->orig);
 		memset(b, 0, sizeof(*b));
 	}
@@ -272,11 +275,11 @@ static int gwc_buf_append(struct gwc_buf *b, const void *data, uint32_t len)
 		while (new_cap < b->len + len)
 			new_cap *= 2;
 
-		new_buf = realloc(b->buf, new_cap + 1);
+		new_buf = realloc(b->orig, new_cap + 1);
 		if (!new_buf)
 			return -ENOMEM;
 
-		b->buf = new_buf;
+		b->orig = b->buf = new_buf;
 		b->cap = new_cap;
 	}
 
@@ -324,10 +327,20 @@ struct gwc_srv_cfg {
 	uint16_t	nr_workers;
 };
 
+struct gwc_tbl_hdr {
+	__be64		last_id;
+	__be64		nr_rows;
+	__be64		size_per_row;
+	__be64		__pad[5];
+} __packed;
+ST_ASSERT(sizeof(struct gwc_tbl_hdr) == 64);
+
 struct gwc_table {
-	int		fd;
-	void		*mem;
-	size_t		size;
+	int			fd;
+	void			*mem;
+	uint64_t		size;
+	struct gwc_tbl_hdr	hdr;
+	pthread_mutex_t		lock;
 };
 
 struct gwc_srv_db {
@@ -406,17 +419,18 @@ static inline size_t pkt_prep_acc_reg(struct gwc_pkt *p, const char *uname,
 	size_t ulen = strlen(uname);
 	size_t plen = strlen(pwd);
 	size_t len = sizeof(p->acc.reg) + ulen + 1 + plen + 1;
+	struct gwc_pkt_acc_udata *reg = &p->acc.reg;
 
 	if (ulen > 255 || plen > 255)
 		return 0;
 
-	p->acc.reg.ulen = ulen;
-	p->acc.reg.plen = plen;
-	memcpy(p->acc.reg.data, uname, ulen);
-	p->acc.reg.data[ulen] = '\0';
-	memcpy(&p->acc.reg.data[ulen + 1], pwd, plen);
-	p->acc.reg.data[ulen + 1 + plen] = '\0';
-
+	reg->ulen = ulen;
+	reg->plen = plen;
+	memcpy(reg->data, uname, ulen);
+	reg->data[ulen] = '\0';
+	memcpy(&reg->data[ulen + 1], pwd, plen);
+	reg->data[ulen + 1 + plen] = '\0';
+	memset(&reg->__pad, 0, sizeof(reg->__pad));
 	return pkt_hdr_prep(p, GWC_PKT_ACC_REGISTER, len);
 }
 
@@ -426,17 +440,18 @@ static inline size_t pkt_prep_acc_login(struct gwc_pkt *p, const char *uname,
 	size_t ulen = strlen(uname);
 	size_t plen = strlen(pwd);
 	size_t len = sizeof(p->acc.login) + ulen + 1 + plen + 1;
+	struct gwc_pkt_acc_udata *login = &p->acc.login;
 
 	if (ulen > 255 || plen > 255)
 		return 0;
 
-	p->acc.login.ulen = ulen;
-	p->acc.login.plen = plen;
-	memcpy(p->acc.login.data, uname, ulen);
-	p->acc.login.data[ulen] = '\0';
-	memcpy(&p->acc.login.data[ulen + 1], pwd, plen);
-	p->acc.login.data[ulen + 1 + plen] = '\0';
-
+	login->ulen = ulen;
+	login->plen = plen;
+	memcpy(login->data, uname, ulen);
+	login->data[ulen] = '\0';
+	memcpy(&login->data[ulen + 1], pwd, plen);
+	login->data[ulen + 1 + plen] = '\0';
+	memset(&login->__pad, 0, sizeof(login->__pad));
 	return pkt_hdr_prep(p, GWC_PKT_ACC_LOGIN, len);
 }
 
@@ -447,18 +462,28 @@ static inline size_t pkt_prep_acc_change_pwd(struct gwc_pkt *p,
 	size_t ulen = strlen(uname);
 	size_t plen = strlen(pwd);
 	size_t len = sizeof(p->acc.change_pwd) + ulen + 1 + plen + 1;
+	struct gwc_pkt_acc_udata *cp = &p->acc.change_pwd;
 
 	if (ulen > 255 || plen > 255)
 		return 0;
 
-	p->acc.change_pwd.ulen = ulen;
-	p->acc.change_pwd.plen = plen;
-	memcpy(p->acc.change_pwd.data, uname, ulen);
-	p->acc.change_pwd.data[ulen] = '\0';
-	memcpy(&p->acc.change_pwd.data[ulen + 1], pwd, plen);
-	p->acc.change_pwd.data[ulen + 1 + plen] = '\0';
-
+	cp->ulen = ulen;
+	cp->plen = plen;
+	memcpy(cp->data, uname, ulen);
+	cp->data[ulen] = '\0';
+	memcpy(&cp->data[ulen + 1], pwd, plen);
+	cp->data[ulen + 1 + plen] = '\0';
+	memset(&cp->__pad, 0, sizeof(cp->__pad));
 	return pkt_hdr_prep(p, GWC_PKT_ACC_CHANGE_PWD, len);
+}
+
+static inline size_t pkt_prep_acc_rl_resp(struct gwc_pkt *p, uint8_t resp)
+{
+	assert(resp >= GWC_RL_LOGIN_OK &&
+	       resp <= GWC_RL_REGISTER_UNAME_INVALID);
+
+	p->acc.rl_resp = resp;
+	return pkt_hdr_prep(p, GWC_PKT_ACC_RESP_RL, sizeof(p->acc.rl_resp));
 }
 
 static inline size_t pkt_prep_chan_subscribe(struct gwc_pkt *p,
@@ -782,14 +807,215 @@ static int gwc_srv_handle_event_accept(struct gwc_srv_wrk *w)
 	return 0;
 }
 
-static int gwc_srv_register_user(struct gwc_srv_wrk *w, struct gwc_srv_cli *c,
-				 const char *uname, const char *pwd)
+static int __gwc_srv_table_insert(struct gwc_table *tb, const void *row,
+				  size_t row_size, void **rptr)
+	__must_hold(&tb->lock)
 {
+	struct gwc_tbl_hdr *hdr = tb->mem;
+	uint64_t size_per_row = be64toh(hdr->size_per_row);
+	uint64_t nr_rows = be64toh(hdr->nr_rows);
+	uint64_t new_size;
+	uint64_t off;
+	int r;
+
+	if (tb->size < sizeof(*hdr))
+		return -EBADMSG;
+	if (row_size != size_per_row)
+		return -EINVAL;
+
+	off = sizeof(*hdr) + (nr_rows * size_per_row);
+	if (off + row_size > tb->size) {
+		void *new_mem;
+
+		new_size = tb->size + size_per_row * 16;
+		new_mem = mremap(tb->mem, tb->size, new_size, MREMAP_MAYMOVE);
+		if (new_mem == MAP_FAILED)
+			return -ENOMEM;
+
+		tb->mem = new_mem;
+		tb->size = new_size;
+		r = ftruncate(tb->fd, tb->size);
+		if (r < 0) {
+			r = -errno;
+			return r;
+		}
+	}
+
+	memcpy((char *)tb->mem + off, row, row_size);
+	if (rptr)
+		*rptr = (char *)tb->mem + off;
+	hdr->nr_rows = htobe64(nr_rows + 1);
+	hdr->last_id = htobe64(be64toh(hdr->last_id) + 1);
+	hdr->size_per_row = htobe64(size_per_row);
+	return msync(tb->mem, tb->size, MS_ASYNC);
+}
+
+static void *gwc_srv_table_get_rowptr(const struct gwc_table *tb)
+{
+	struct gwc_tbl_hdr *hdr = tb->mem;
+
+	if (tb->size < sizeof(*hdr))
+		return NULL;
+
+	return (char *)tb->mem + sizeof(*hdr);
+}
+
+static void *gwc_srv_table_get_endptr(const struct gwc_table *tb)
+{
+	struct gwc_tbl_hdr *hdr = tb->mem;
+	uint64_t size_per_row = be64toh(hdr->size_per_row);
+	uint64_t nr_rows = be64toh(hdr->nr_rows);
+	uint64_t max_off;
+
+	if (tb->size < sizeof(*hdr))
+		return NULL;
+
+	max_off = sizeof(*hdr) + (nr_rows * size_per_row);
+	if (max_off > tb->size)
+		return NULL;
+
+	return (char *)tb->mem + max_off;
+}
+
+static int gwc_srv_table_fetch_row(const struct gwc_table *tb, uint64_t row_id,
+				   void **row, size_t *row_size)
+{
+	struct gwc_tbl_hdr *hdr = tb->mem;
+	uint64_t size_per_row = be64toh(hdr->size_per_row);
+	uint64_t nr_rows = be64toh(hdr->nr_rows);
+	uint64_t max_off, off;
+
+	off = sizeof(*hdr) + (row_id * size_per_row);
+	max_off = sizeof(*hdr) + (nr_rows * size_per_row);
+
+	if (off >= max_off)
+		return -ENOENT;
+
+	if (*row_size != be64toh(hdr->size_per_row))
+		return -EBADMSG; /* Table corrupted? */
+
+	*row = (char *)tb->mem + off;
 	return 0;
 }
 
-static int gwc_srv_handle_event_send(struct gwc_srv_wrk *w,
-				     struct gwc_srv_cli *c);
+static uint64_t __gwc_srv_table_get_nr_rows(const struct gwc_table *tb)
+	__must_hold(&tb->lock)
+{
+	struct gwc_tbl_hdr *hdr = tb->mem;
+	return be64toh(hdr->nr_rows);
+}
+
+static int __gwc_srv_db_find_user_by_uname(struct gwc_srv_db *db,
+					   const char *uname,
+					   struct gwc_user **u)
+	__must_hold(&db->users.lock)
+{
+	struct gwc_table *users = &db->users;
+	uint64_t i, nr_rows = __gwc_srv_table_get_nr_rows(users);
+
+	for (i = 0; i < nr_rows; i++) {
+		struct gwc_user *row;
+		size_t row_size = sizeof(*row);
+		int r;
+
+		r = gwc_srv_table_fetch_row(users, i, (void **)&row, &row_size);
+		if (r < 0)
+			return r;
+
+		if (!strncmp(row->uname, uname, sizeof(row->uname))) {
+			if (u)
+				*u = row;
+			return 0;
+		}
+	}
+
+	return -ENOENT;
+}					   
+
+static int gwc_srv_db_find_user_by_uname(struct gwc_srv_db *db,
+					 const char *uname,
+					 struct gwc_user **u)
+{
+	int r;
+	pthread_mutex_lock(&db->users.lock);
+	r = __gwc_srv_db_find_user_by_uname(db, uname, u);
+	pthread_mutex_unlock(&db->users.lock);
+	return r;
+}
+
+static int gwc_srv_db_insert_user(struct gwc_srv_db *db, struct gwc_user *u,
+				   struct gwc_user **up)
+{
+	struct gwc_table *users = &db->users;
+	size_t row_size = sizeof(*u);
+	int r;
+
+	pthread_mutex_lock(&db->users.lock);
+	r = __gwc_srv_db_find_user_by_uname(db, u->uname, up);
+	if (r == -ENOENT) {
+		u->id = be64toh(users->hdr.last_id) + 1;
+		r = __gwc_srv_table_insert(users, u, row_size, (void **)up);
+	} else {
+		r = r ? r : -EEXIST;
+	}
+	pthread_mutex_unlock(&db->users.lock);
+	return r;
+}
+
+static int gwc_srv_send_rl(struct gwc_srv_cli *c, uint8_t code)
+{
+	struct gwc_pkt resp;
+	size_t len;
+
+	len = pkt_prep_acc_rl_resp(&resp, code);
+	return gwc_buf_append(&c->sn_buf, &resp, len);
+}
+
+static int gwc_srv_register_user(struct gwc_srv_wrk *w, struct gwc_srv_cli *c,
+				 const char *uname, const char *pwd)
+{
+	struct gwc_user u, *up;
+	size_t l;
+	int r;
+
+	memset(&u, 0, sizeof(u));
+	l = sizeof(u.uname) - 1;
+	strncpy(u.uname, uname, l);
+	u.uname[l] = '\0';
+	l = sizeof(u.pwd) - 1;
+	strncpy(u.pwd, pwd, l);
+	u.pwd[l] = '\0';
+
+	r = gwc_srv_db_insert_user(&w->ctx->db, &u, &up);
+	if (r == -EEXIST) {
+		fprintf(stderr, "register: User '%s' already exists.\n", uname);
+		return gwc_srv_send_rl(c, GWC_RL_REGISTER_UNAME_EXISTS);
+	} else if (r < 0) {
+		fprintf(stderr, "register: Failed to register user '%s': %s\n", uname,
+			strerror(-r));
+		return r;
+	}
+
+	c->user = up;
+	return gwc_srv_send_rl(c, GWC_RL_REGISTER_OK);
+}
+
+static int gwc_srv_login_user(struct gwc_srv_wrk *w, struct gwc_srv_cli *c,
+			       const char *uname, const char *pwd)
+{
+	struct gwc_user *u;
+	int r;
+
+	r = gwc_srv_db_find_user_by_uname(&w->ctx->db, uname, &u);
+	if (r < 0)
+		return r;
+
+	if (strcmp(u->pwd, pwd) != 0)
+		return gwc_srv_send_rl(c, GWC_RL_LOGIN_ERR);
+
+	c->user = u;
+	return gwc_srv_send_rl(c, GWC_RL_LOGIN_OK);
+}
 
 static int gwc_srv_handle_pkt_conn_hs(struct gwc_srv_wrk *w,
 				      struct gwc_srv_cli *c)
@@ -810,13 +1036,38 @@ static int gwc_srv_handle_pkt_conn_hs(struct gwc_srv_wrk *w,
 	return 0;
 }
 
-static int gwc_srv_handle_pkt_acc_reg(struct gwc_srv_wrk *w,
-				      struct gwc_srv_cli *c)
+static bool validate_uname(const char *c, size_t len)
+{
+	size_t i;
+
+	if (len < 3 || len > 127)
+		return false;
+
+	for (i = 0; i < len; i++) {
+		char x = c[i];
+
+		// Allowed chars: a-z, A-Z, 0-9, _, -, .
+		if ((x >= 'a' && x <= 'z') ||
+		    (x >= 'A' && x <= 'Z') ||
+		    (x >= '0' && x <= '9') ||
+		    x == '_' || x == '-' || x == '.')
+			continue;
+
+		return false;
+	}
+
+	return true;
+}
+
+static int gwc_srv_handle_pkt_acc_reg_or_login(struct gwc_srv_wrk *w,
+					       struct gwc_srv_cli *c,
+					       bool is_login)
 {
 	struct gwc_pkt_acc_udata *reg = &c->rc_buf.acc.reg;
 	struct gwc_pkt *p = &c->rc_buf;
 	char uname[128], pwd[128];
 	size_t tot_len;
+	size_t l;
 
 	if (p->hdr.len < sizeof(p->acc.reg))
 		return -EINVAL;
@@ -826,10 +1077,26 @@ static int gwc_srv_handle_pkt_acc_reg(struct gwc_srv_wrk *w,
 	if (p->hdr.len != tot_len)
 		return -EINVAL;
 
-	strncpy(uname, reg->data, sizeof(uname) - 1);
-	uname[sizeof(uname) - 1] = '\0';
-	strncpy(pwd, &reg->data[reg->ulen + 1], sizeof(pwd) - 1);
-	pwd[sizeof(pwd) - 1] = '\0';
+	l = sizeof(uname) - 1;
+	strncpy(uname, reg->data, l);
+	uname[l] = '\0';
+	if (strlen(uname) != reg->ulen)
+		return -EINVAL;
+
+	l = sizeof(pwd) - 1;
+	strncpy(pwd, &reg->data[reg->ulen + 1], l);
+	pwd[l] = '\0';
+	if (strlen(pwd) != reg->plen)
+		return -EINVAL;
+
+	if (!validate_uname(uname, reg->ulen))
+		return gwc_srv_send_rl(c,
+			is_login ? GWC_RL_LOGIN_ERR :
+			GWC_RL_REGISTER_UNAME_INVALID);
+
+	if (is_login)
+		return gwc_srv_login_user(w, c, uname, pwd);
+
 	return gwc_srv_register_user(w, c, uname, pwd);
 }
 
@@ -843,9 +1110,9 @@ static int gwc_srv_handle_cli_pkt(struct gwc_srv_wrk *w, struct gwc_srv_cli *c)
 	case GWC_PKT_CONN_CLOSE:
 		return -ECONNRESET;
 	case GWC_PKT_ACC_REGISTER:
-		return gwc_srv_handle_pkt_acc_reg(w, c);
-	// case GWC_PKT_ACC_LOGIN:
-	// 	return gwc_srv_handle_pkt_acc_login(w, c);
+		return gwc_srv_handle_pkt_acc_reg_or_login(w, c, false);
+	case GWC_PKT_ACC_LOGIN:
+		return gwc_srv_handle_pkt_acc_reg_or_login(w, c, true);
 	// case GWC_PKT_ACC_CHANGE_PWD:
 	// 	return gwc_srv_handle_pkt_acc_change_pwd(w, c);
 	// case GWC_PKT_CHAN_SUBSCRIBE:
@@ -863,6 +1130,9 @@ static int gwc_srv_handle_cli_pkt(struct gwc_srv_wrk *w, struct gwc_srv_cli *c)
 		return -EINVAL;
 	}
 }
+
+static int gwc_srv_handle_event_send(struct gwc_srv_wrk *w,
+				     struct gwc_srv_cli *c);
 
 static int __gwc_srv_handle_event_recv(struct gwc_srv_wrk *w,
 				       struct gwc_srv_cli *c)
@@ -884,8 +1154,13 @@ repeat:
 
 	p->hdr.len = len;
 	r = gwc_srv_handle_cli_pkt(w, c);
-	if (r)
+	if (r) {
+		if (r == -EINVAL)
+			printf("Invalid packet received from client %s\n",
+			       skaddr_to_str(&c->addr));
+
 		return r;
+	}
 
 	c->rc_len -= expected_len;
 	if (c->rc_len) {
@@ -1078,9 +1353,38 @@ static void *gwc_srv_worker_func(void *arg)
 	return (void *)(intptr_t)r;
 }
 
-static int gwc_srv_open_table(const char *dir, const char *fname,
-			      struct gwc_table *tb)
+static int gwc_srv_table_init(struct gwc_table *tb, size_t row_size)
 {
+	struct gwc_tbl_hdr *hdr = tb->mem;
+
+	memset(hdr, 0, sizeof(*hdr));
+	hdr->nr_rows = htobe64(0);
+	hdr->size_per_row = htobe64(row_size);
+	return msync(tb->mem, tb->size, MS_SYNC);
+}
+
+static int gwc_srv_table_validate(struct gwc_table *tb, size_t row_size)
+{
+	struct gwc_tbl_hdr *hdr = tb->mem;
+	uint64_t size_per_row = be64toh(hdr->size_per_row);
+	uint64_t nr_rows = be64toh(hdr->nr_rows);
+
+	if (tb->size < sizeof(*hdr))
+		return -EBADMSG;
+
+	if (row_size != size_per_row)
+		return -EBADMSG;
+
+	if (nr_rows > (tb->size - sizeof(*hdr)) / size_per_row)
+		return -EBADMSG;
+
+	return 0;
+}
+
+static int gwc_srv_table_open(const char *dir, const char *fname,
+			      struct gwc_table *tb, size_t row_size)
+{
+	bool is_initialization = false;
 	char *full_fname;
 	struct stat st;
 	void *mem;
@@ -1105,12 +1409,14 @@ static int gwc_srv_open_table(const char *dir, const char *fname,
 
 	tb->size = st.st_size;
 	if (!tb->size) {
-		tb->size = 1024 * 10;
+		tb->size = sizeof(struct gwc_tbl_hdr) + row_size;
 		r = ftruncate(fd, tb->size);
 		if (r < 0) {
 			r = -errno;
 			goto out_close;
 		}
+
+		is_initialization = true;
 	}
 
 	mem = mmap(NULL, tb->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -1121,9 +1427,32 @@ static int gwc_srv_open_table(const char *dir, const char *fname,
 
 	tb->fd = fd;
 	tb->mem = mem;
-	free(full_fname);
-	return 0;
+	if (is_initialization) {
+		r = gwc_srv_table_init(tb, row_size);
+		if (!r)
+			printf("Table '%s' initialized.\n", full_fname);
+	} else {
+		r = gwc_srv_table_validate(tb, row_size);
+		if (r) {
+			fprintf(stderr,
+				"Table '%s' validation failed: %s. Table corrupted?\n",
+				full_fname, strerror(-r));
+			goto out_unmap;
+		}
+		printf("Table '%s' opened successfully.\n", full_fname);
+	}
 
+	r = pthread_mutex_init(&tb->lock, NULL);
+	if (r) {
+		r = -r;
+		goto out_unmap;
+	}
+
+	free(full_fname);
+	return r;
+
+out_unmap:
+	munmap(tb->mem, tb->size);
 out_close:
 	close(fd);
 out_err:
@@ -1132,10 +1461,10 @@ out_err:
 	return r;
 }
 
-static void gwc_srv_close_table(struct gwc_table *tb)
+static void gwc_srv_table_close(struct gwc_table *tb)
 {
 	if (tb->mem) {
-		msync(tb->mem, tb->size, MS_ASYNC);
+		msync(tb->mem, tb->size, MS_SYNC);
 		munmap(tb->mem, tb->size);
 		tb->mem = NULL;
 	}
@@ -1146,16 +1475,22 @@ static void gwc_srv_close_table(struct gwc_table *tb)
 	}
 
 	tb->size = 0;
+	pthread_mutex_destroy(&tb->lock);
+}
+
+static void gwc_srv_table_sync(struct gwc_table *tb)
+{
+	msync(tb->mem, tb->size, MS_ASYNC);
 }
 
 static int gwc_srv_free_storage(struct gwc_srv_ctx *ctx)
 {
 	struct gwc_srv_db *db = &ctx->db;
 
-	gwc_srv_close_table(&db->chan_subs);
-	gwc_srv_close_table(&db->messages);
-	gwc_srv_close_table(&db->channels);
-	gwc_srv_close_table(&db->users);
+	gwc_srv_table_close(&db->chan_subs);
+	gwc_srv_table_close(&db->messages);
+	gwc_srv_table_close(&db->channels);
+	gwc_srv_table_close(&db->users);
 	return 0;
 }
 
@@ -1163,6 +1498,7 @@ static int gwc_srv_init_storage(struct gwc_srv_ctx *ctx)
 {
 	const char *dir = ctx->cfg.data_dir;
 	struct gwc_srv_db *db = &ctx->db;
+	size_t l;
 	int r = 0;
 
 	r = mkdir(dir, 0755);
@@ -1173,27 +1509,31 @@ static int gwc_srv_init_storage(struct gwc_srv_ctx *ctx)
 		return r;
 	}
 
-	r = gwc_srv_open_table(dir, "tb_users.bin", &db->users);
+	l = sizeof(struct gwc_user);
+	r = gwc_srv_table_open(dir, "tb_users.bin", &db->users, l);
 	if (r)
 		return r;
-	r = gwc_srv_open_table(dir, "tb_channels.bin", &db->channels);
+	l = sizeof(struct gwc_channel);
+	r = gwc_srv_table_open(dir, "tb_channels.bin", &db->channels, l);
 	if (r)
 		goto oe_users;
-	r = gwc_srv_open_table(dir, "tb_messages.bin", &db->messages);
+	l = sizeof(struct gwc_message);
+	r = gwc_srv_table_open(dir, "tb_messages.bin", &db->messages, l);
 	if (r)
 		goto oe_channels;
-	r = gwc_srv_open_table(dir, "tb_chan_subs.bin", &db->chan_subs);
+	l = sizeof(struct gwc_chan_sub);
+	r = gwc_srv_table_open(dir, "tb_chan_subs.bin", &db->chan_subs, l);
 	if (r)
 		goto oe_messages;
 
 	return 0;
 
 oe_messages:
-	gwc_srv_close_table(&db->messages);
+	gwc_srv_table_close(&db->messages);
 oe_channels:
-	gwc_srv_close_table(&db->channels);
+	gwc_srv_table_close(&db->channels);
 oe_users:
-	gwc_srv_close_table(&db->users);
+	gwc_srv_table_close(&db->users);
 	return r;
 }
 
@@ -1691,10 +2031,28 @@ static char *fgets_stdin_and_trim(char *buf, size_t size)
 	return buf;
 }
 
+static void gwc_cli_print_rl_error(uint8_t resp)
+{
+	printf("Action failed: ");
+	#define GWC_RL_ERR_CASE(x) case x: printf(#x "\n"); break
+	switch (resp) {
+	GWC_RL_ERR_CASE(GWC_RL_LOGIN_OK);
+	GWC_RL_ERR_CASE(GWC_RL_LOGIN_ERR);
+	GWC_RL_ERR_CASE(GWC_RL_REGISTER_OK);
+	GWC_RL_ERR_CASE(GWC_RL_REGISTER_ERR);
+	GWC_RL_ERR_CASE(GWC_RL_REGISTER_UNAME_EXISTS);
+	GWC_RL_ERR_CASE(GWC_RL_REGISTER_UNAME_INVALID);
+	default:
+		printf("Unknown response code: %u\n", resp);
+		break;
+	}
+}
+
 static int gwc_cli_do_register_or_login(struct gwc_cli_ctx *ctx)
 {
 	struct gwc_cli_cfg *cfg = &ctx->cfg;
-	struct gwc_pkt sp;
+	struct gwc_pkt sp, *p;
+	uint8_t resp;
 	ssize_t ret;
 	size_t len;
 
@@ -1726,7 +2084,24 @@ static int gwc_cli_do_register_or_login(struct gwc_cli_ctx *ctx)
 	if (ret < 0)
 		return ret;
 
-	return 0;
+	p = &ctx->rc_buf;
+	ret = gwc_cli_do_recv_all(ctx, sizeof(p->hdr) + sizeof(p->acc.rl_resp));
+	if (ret < 0)
+		return ret;
+
+	resp = p->acc.rl_resp;
+	if (cfg->do_register && resp == GWC_RL_REGISTER_OK) {
+		printf("Registration successful!\n");
+		return 0;
+	}
+
+	if (!cfg->do_register && resp == GWC_RL_LOGIN_OK) {
+		printf("Login successful!\n");
+		return 0;
+	}
+
+	gwc_cli_print_rl_error(resp);
+	return -EBADMSG;
 }
 
 static int gwc_cli_run(struct gwc_cli_ctx *ctx)

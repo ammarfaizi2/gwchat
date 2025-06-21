@@ -1,10 +1,10 @@
 
 COMMON_FLAGS = -Wall -Wextra -Wno-gnu -Os -ggdb3 -ffunction-sections \
 	-fdata-sections -flto -Wno-unused-function -Wno-unused-parameter \
-	-fno-strict-aliasing
+	-fno-strict-aliasing -fsanitize=address -fsanitize=undefined
 CXXFLAGS = -std=gnu++20 $(COMMON_FLAGS)
 CFLAGS = -std=gnu11 $(COMMON_FLAGS)
-LDFLAGS = -Os -ggdb3 -flto
+LDFLAGS = -Os -ggdb3 -flto -fsanitize=address -fsanitize=undefined
 LIBS = -lpthread
 
 all: gwchat
