@@ -165,6 +165,7 @@ struct gwc_pkt {
 			__be64				subscribe;
 			__be64				unsubscribe;
 			struct gwc_pkt_chan_list	chan_list;
+			struct gwc_pkt_chan_data	create;
 		} chan __packed;
 
 		char	__raw[2048 - sizeof(struct gwc_hdr_pkt)];
@@ -184,6 +185,7 @@ ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, chan));
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, chan.subscribe));
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, chan.unsubscribe));
 ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, chan.chan_list));
+ST_ASSERT(sizeof(struct gwc_hdr_pkt) == offsetof(struct gwc_pkt, chan.create));
 
 
 #define GWC_USER_MIN_SIZE	(8 + 1 + 1 + 512)
@@ -562,6 +564,23 @@ static inline size_t pkt_prep_chan_list(struct gwc_pkt *p, uint64_t nr_chan)
 {
 	p->chan.chan_list.nr_chan = htobe64(nr_chan);
 	return pkt_hdr_prep(p, GWC_PKT_CHAN_LIST, sizeof(p->chan.chan_list));
+}
+
+static inline size_t pkt_prep_chan_create(struct gwc_pkt *p, const char *name)
+{
+	size_t nlen = strlen(name);
+	size_t len = sizeof(p->chan.create) + nlen + 1;
+	struct gwc_pkt_chan_data *create = &p->chan.create;
+
+	if (nlen > 255)
+		return 0;
+
+	create->chan_id = 0;
+	create->nlen = nlen;
+	memcpy(create->data, name, nlen);
+	create->data[nlen] = '\0';
+	memset(&create->__pad, 0, sizeof(create->__pad));
+	return pkt_hdr_prep(p, GWC_PKT_CHAN_CREATE, len);
 }
 
 static const struct option server_long_opts[] = {
@@ -1047,8 +1066,8 @@ static int gwc_srv_register_user(struct gwc_srv_wrk *w, struct gwc_srv_cli *c,
 		fprintf(stderr, "register: User '%s' already exists.\n", uname);
 		return gwc_srv_send_rl(c, GWC_RL_REGISTER_UNAME_EXISTS);
 	} else if (r < 0) {
-		fprintf(stderr, "register: Failed to register user '%s': %s\n", uname,
-			strerror(-r));
+		fprintf(stderr, "register: Failed to register user '%s': %s\n",
+			uname, strerror(-r));
 		return r;
 	}
 
@@ -1057,7 +1076,7 @@ static int gwc_srv_register_user(struct gwc_srv_wrk *w, struct gwc_srv_cli *c,
 }
 
 static int gwc_srv_login_user(struct gwc_srv_wrk *w, struct gwc_srv_cli *c,
-			       const char *uname, const char *pwd)
+			      const char *uname, const char *pwd)
 {
 	struct gwc_user *u;
 	int r;
@@ -1346,7 +1365,9 @@ static int gwc_srv_handle_events(struct gwc_srv_wrk *w, int nr_events)
 	if (pfd[0].revents) {
 		r = gwc_srv_handle_event_accept(w);
 		if (r < 0) {
-			fprintf(stderr, "Failed to handle accept event: %s\n", strerror(-r));
+			fprintf(stderr,
+				"Failed to handle accept event: %s\n",
+				strerror(-r));
 			return r;
 		}
 		nr_events--;
@@ -1957,7 +1978,8 @@ static int gwc_cli_do_connect(struct gwc_cli_ctx *ctx)
 	r = getsockopt(ctx->tcp_fd, SOL_SOCKET, SO_ERROR, &err, &len);
 	if (r < 0) {
 		r = -errno;
-		fprintf(stderr, "Failed to get socket error: %s\n", strerror(-r));
+		fprintf(stderr, "Failed to get socket error: %s\n",
+			strerror(-r));
 		return r;
 	}
 
@@ -2136,6 +2158,7 @@ static void gwc_cli_print_rl_error(uint8_t resp)
 
 static int gwc_cli_do_register_or_login(struct gwc_cli_ctx *ctx)
 {
+	const char *act = ctx->cfg.do_register ? "Create" : "Login";
 	struct gwc_cli_cfg *cfg = &ctx->cfg;
 	struct gwc_pkt sp, *p;
 	uint8_t resp;
@@ -2143,13 +2166,13 @@ static int gwc_cli_do_register_or_login(struct gwc_cli_ctx *ctx)
 	size_t len;
 
 	if (!cfg->uname[0]) {
-		printf("%s username: ", cfg->do_register ? "Create" : "Login");
+		printf("%s username: ", act);
 		if (!fgets_stdin_and_trim(cfg->uname, sizeof(cfg->uname)))
 			return -EIO;
 	}
 
 	if (!cfg->pwd[0]) {
-		printf("%s password: ", cfg->do_register ? "Create" : "Login");
+		printf("%s password: ", act);
 		if (!fgets_stdin_and_trim(cfg->pwd, sizeof(cfg->pwd)))
 			return -EIO;
 	}
@@ -2209,14 +2232,44 @@ static void gwc_cli_show_help(void)
 	printf("  chan_create <channel_name> - create a new channel\n");
 }
 
+static int gwc_cli_cmd_chan_create(struct gwc_cli_ctx *ctx, const char *arg)
+{
+	struct gwc_pkt sp;
+	ssize_t ret;
+	size_t len;
+
+	printf("Creating channel '%s'...\n", arg);
+	len = pkt_prep_chan_create(&sp, arg);
+	ret = gwc_buf_append(&ctx->sn_buf, &sp, len);
+	if (ret)
+		return ret;
+
+	ret = gwc_cli_do_send_all(ctx);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
 static int gwc_cli_handle_event_stdin(struct gwc_cli_ctx *ctx)
 {
 	size_t l = sizeof(ctx->cmd_buf);
 	char *b = ctx->cmd_buf;
+	char *arg;
 
 	if (!fgets_stdin_and_trim(b, l)) {
-		fprintf(stderr, "Failed to read from stdin: %s\n", strerror(errno));
+		fprintf(stderr, "Failed to read from stdin: %s\n",
+			strerror(errno));
 		return -EIO;
+	}
+
+	arg = strchr(b, ' ');
+	if (arg) {
+		*arg++ = '\0';
+		while (*arg && isspace((unsigned char)*arg))
+			arg++;
+	} else {
+		arg = NULL;
 	}
 
 	if (!strcmp(b, "exit") || !strcmp(b, "quit") || !strcmp(b, "q")) {
@@ -2228,6 +2281,14 @@ static int gwc_cli_handle_event_stdin(struct gwc_cli_ctx *ctx)
 	if (!strcmp(b, "help") || !strcmp(b, "?")) {
 		gwc_cli_show_help();
 		return 0;
+	}
+
+	if (!strcmp(b, "chan_create")) {
+		if (!arg) {
+			printf("Usage: chan_create <channel_name>\n");
+			return 0;
+		}
+		return gwc_cli_cmd_chan_create(ctx, arg);
 	}
 
 	if (!*b)
